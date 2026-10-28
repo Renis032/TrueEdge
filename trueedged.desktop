@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=TrueEdge
+Comment=Move the mouse between monitors where they physically meet
+Exec=sh -c '"$HOME/.local/bin/trueedged"'
+OnlyShowIn=KDE;
+X-KDE-autostart-phase=2
+NoDisplay=true

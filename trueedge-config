@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""trueedge-config — arrange monitors by their real size and position for trueedged.
+
+Drag the monitors until they sit like they do on your desk (edges snap; hold
+Shift to place freely), correct the sizes with a ruler if the EDID is off,
+then Save & apply: the layout is written and a running trueedged reloads it.
+"""
+import math
+import os
+import shutil
+import subprocess
+import sys
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                      "trueedge", "layout.conf")
+SNAP_MM = 15
+
+
+def daemon_path():
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "trueedged")
+    return here if os.access(here, os.X_OK) else shutil.which("trueedged") or "trueedged"
+
+
+def read_layout(defaults=False):
+    """Returns (monitors, jump) as trueedged sees them; defaults ignores layout.conf."""
+    args = [daemon_path(), "--print"] + (["--defaults"] if defaults else [])
+    out = subprocess.run(args, check=True, stdout=subprocess.PIPE, universal_newlines=True).stdout
+    mons, jump = [], True
+    for line in out.splitlines():
+        body, _, comment = line.partition("#")
+        f = body.split()
+        if f[:1] == ["jump"]:
+            jump = f[1] != "0"
+        elif f[:1] == ["monitor"]:
+            geo = comment.split()[0]  # WxH+X+Y
+            w, rest = geo.split("x", 1)
+            h, px, py = rest.split("+")
+            mons.append(dict(name=f[1], x=float(f[2]), y=float(f[3]), w=float(f[4]), h=float(f[5]),
+                             pw=int(w), ph=int(h), px=int(px), py=int(py), primary="primary" in comment))
+    return mons, jump
+
+
+def pixel_positions(mons, tol_mm=5):
+    """Screen positions (px) that reproduce the mm layout: neighbours stay touching
+    in pixels and are offset along the shared edge by their mm offset.
+
+    Starts from the primary monitor; monitors not beside a placed one keep
+    their current position. The result is shifted to start at 0, 0."""
+    def beside(a, b):
+        """(axis, side) if b sits right of / below (+1) or left of / above (-1) a."""
+        for axis, (o, s) in enumerate((("x", "w"), ("y", "h"))):
+            p_o, p_s = ("y", "h") if axis == 0 else ("x", "w")
+            if b[p_o] >= a[p_o] + a[p_s] or a[p_o] >= b[p_o] + b[p_s]:
+                continue  # no overlap along the edge
+            if b[o] >= a[o] + a[s] - tol_mm:
+                return axis, 1, b[o] - (a[o] + a[s])
+            if b[o] + b[s] <= a[o] + tol_mm:
+                return axis, -1, a[o] - (b[o] + b[s])
+        return None
+
+    pos = {}
+    order = sorted(mons, key=lambda m: not m["primary"])
+    pos[order[0]["name"]] = [order[0]["px"], order[0]["py"]]
+    while len(pos) < len(mons):
+        best = None  # closest (gap, a, b, relation) between a placed and an unplaced monitor
+        for a in mons:
+            for b in mons:
+                if a["name"] in pos and b["name"] not in pos:
+                    rel = beside(a, b)
+                    if rel and (best is None or rel[2] < best[0]):
+                        best = (rel[2], a, b, rel)
+        if best is None:
+            for m in mons:
+                pos.setdefault(m["name"], [m["px"], m["py"]])
+            break
+        _, a, b, (axis, side, _) = best
+        size = ("pw", "ph")
+        p = 1 - axis
+        new = [0, 0]
+        new[axis] = pos[a["name"]][axis] + (a[size[axis]] if side > 0 else -b[size[axis]])
+        o, s = ("y", "h") if axis == 0 else ("x", "w")
+        new[p] = pos[a["name"]][p] + round((b[o] - a[o]) * a[size[p]] / a[s])
+        pos[b["name"]] = new
+    lo = [min(v[i] for v in pos.values()) for i in (0, 1)]
+    return {n: (v[0] - lo[0], v[1] - lo[1]) for n, v in pos.items()}
+
+
+def screen_geometry(mon):
+    """The monitor's rectangle in Qt coordinates (honours Qt scaling)."""
+    for screen in QtGui.QGuiApplication.screens():
+        if screen.name() == mon["name"]:
+            return screen.geometry()
+    return QtCore.QRect(mon["px"], mon["py"], mon["pw"], mon["ph"])
+
+
+class RulerStrip(QtWidgets.QWidget):
+    """A ruler along one edge of one monitor, ticked in layout millimetres.
+
+    Every monitor uses the same mm coordinates, so the marks continue straight
+    across the bezel exactly when the layout matches the desk."""
+
+    THICKNESS = 56
+    EDGES = ("left", "right", "top", "bottom")
+
+    def __init__(self, item, edge):
+        super().__init__(None, QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint |
+                         QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.X11BypassWindowManagerHint)
+        self.item, self.edge = item, edge
+        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        g, t = screen_geometry(item.mon), self.THICKNESS
+        self.setGeometry({  # left/right run full height; top/bottom fit between them
+            "left": QtCore.QRect(g.x(), g.y(), t, g.height()),
+            "right": QtCore.QRect(g.right() - t + 1, g.y(), t, g.height()),
+            "top": QtCore.QRect(g.x() + t, g.y(), g.width() - 2 * t, t),
+            "bottom": QtCore.QRect(g.x() + t, g.bottom() - t + 1, g.width() - 2 * t, t),
+        }[edge])
+
+    def paintEvent(self, event):
+        m, g, t = self.item.mon, screen_geometry(self.item.mon), self.THICKNESS
+        horizontal = self.edge in ("top", "bottom")
+        start_mm = m["x"] if horizontal else m["y"]
+        px_per_mm = g.width() / m["w"] if horizontal else g.height() / m["h"]
+        offset = self.x() - g.x() if horizontal else self.y() - g.y()  # strip start within the monitor
+        length = self.width() if horizontal else self.height()
+
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), QtGui.QColor("#f2d04b"))
+        font = QtGui.QFont()
+        font.setPixelSize(13)
+        p.setFont(font)
+        first = math.ceil(start_mm + offset / px_per_mm)
+        last = math.floor(start_mm + (offset + length) / px_per_mm)
+        for mm in range(first, last + 1):
+            pos = round((mm - start_mm) * px_per_mm - offset)
+            size = t * (0.6 if mm % 10 == 0 else 0.4 if mm % 5 == 0 else 0.2)
+            p.setPen(QtGui.QPen(QtGui.QColor("#c0392b" if mm % 100 == 0 else "black"), 1))
+            # ticks grow inwards from the screen's outer border, the side facing the bezel
+            if self.edge == "top":
+                p.drawLine(pos, 0, pos, size)
+            elif self.edge == "bottom":
+                p.drawLine(pos, t, pos, t - size)
+            elif self.edge == "left":
+                p.drawLine(0, pos, size, pos)
+            else:
+                p.drawLine(t, pos, t - size, pos)
+            if mm % 10 == 0:
+                label = str(mm // 10)  # cm
+                if horizontal:
+                    y = t - size - 4 if self.edge == "bottom" else size + 14
+                    p.drawText(pos - 10, y - 13, 20, 14, QtCore.Qt.AlignCenter, label)
+                else:
+                    x = 2 if self.edge == "right" else t - 26
+                    p.drawText(x, pos - 7, 24, 14, QtCore.Qt.AlignCenter, label)
+        p.setPen(QtGui.QColor("#555"))
+        p.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+
+class MonitorItem(QtWidgets.QGraphicsRectItem):
+    def __init__(self, mon, window):
+        super().__init__()
+        self.mon, self.window = mon, window
+        self.setFlags(self.ItemIsMovable | self.ItemIsSelectable | self.ItemSendsGeometryChanges)
+        self.setBrush(QtGui.QColor("#2d5b8c" if mon["primary"] else "#3b6e3b"))
+        self.setPen(QtGui.QPen(QtGui.QColor("#ddd"), 2))
+        self.label = QtWidgets.QGraphicsSimpleTextItem(self)
+        self.label.setBrush(QtGui.QColor("white"))
+        font = QtGui.QFont()
+        font.setPixelSize(16)
+        self.label.setFont(font)
+        self.setPos(mon["x"], mon["y"])
+        self.sync_size()
+
+    def sync_size(self):
+        m = self.mon
+        self.setRect(0, 0, m["w"], m["h"])
+        dpi = m["pw"] / (m["w"] / 25.4)
+        diag = (m["w"] ** 2 + m["h"] ** 2) ** 0.5 / 25.4
+        self.label.setText(f'{m["name"]}{"  (primary)" if m["primary"] else ""}\n'
+                           f'{m["pw"]}×{m["ph"]} px\n{m["w"]:.0f}×{m["h"]:.0f} mm\n'
+                           f'{diag:.1f}"  {dpi:.0f} DPI')
+        self.label.setPos(10, 10)
+
+    def itemChange(self, change, value):
+        if change == self.ItemPositionChange and self.scene():
+            if not QtWidgets.QApplication.keyboardModifiers() & QtCore.Qt.ShiftModifier:
+                value = self.snapped(value)
+            return value
+        if change == self.ItemPositionHasChanged:
+            self.mon["x"], self.mon["y"] = self.pos().x(), self.pos().y()
+            self.window.item_moved(self)
+        return super().itemChange(change, value)
+
+    def snapped(self, pos):
+        """Snaps each axis to the closest touching/aligned edge of another monitor."""
+        x, y, w, h = pos.x(), pos.y(), self.mon["w"], self.mon["h"]
+        best = [SNAP_MM, SNAP_MM]
+        out = [x, y]
+        for other in self.window.items:
+            if other is self:
+                continue
+            o = other.mon
+            for axis, (p, s, op, os_) in enumerate([(x, w, o["x"], o["w"]), (y, h, o["y"], o["h"])]):
+                for cand in (op + os_, op - s, op, op + os_ - s):  # touch after/before, align start/end
+                    if abs(cand - p) < best[axis]:
+                        best[axis], out[axis] = abs(cand - p), cand
+        return QtCore.QPointF(*out)
+
+
+class Window(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("TrueEdge — layout")
+        self.resize(1000, 600)
+        self.scene = QtWidgets.QGraphicsScene(self)
+        self.view = QtWidgets.QGraphicsView(self.scene)
+        self.view.setRenderHint(QtGui.QPainter.Antialiasing)
+        self.view.setBackgroundBrush(QtGui.QColor("#202020"))
+        self.view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.items = []
+        self.updating = False
+
+        self.spins = {}
+        form = QtWidgets.QFormLayout()
+        self.selected_label = QtWidgets.QLabel("Select a monitor")
+        form.addRow(self.selected_label)
+        for key, label in (("x", "Left (mm)"), ("y", "Top (mm)"), ("w", "Width (mm)"), ("h", "Height (mm)")):
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-10000 if key in "xy" else 10, 10000)
+            spin.setDecimals(1)
+            spin.valueChanged.connect(self.spin_changed)
+            self.spins[key] = spin
+            form.addRow(label, spin)
+        self.jump = QtWidgets.QCheckBox("Jump to the nearest monitor\nwhen nothing is beyond the edge")
+        self.jump.setStyleSheet("QCheckBox { spacing: 6px }")
+        form.addRow(self.jump)
+        hint = QtWidgets.QLabel("Drag monitors to match your desk.\nEdges snap; hold Shift to place freely.\n"
+                                "Measure the visible screen area\nwith a ruler if sizes look wrong.")
+        hint.setStyleSheet("color: gray")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        self.rulers = []
+        self.ruler_toggle = QtWidgets.QPushButton("Show rulers")
+        self.ruler_toggle.setCheckable(True)
+        self.ruler_toggle.setToolTip("Rulers on every screen edge, in layout mm.\n"
+                                     "Move or resize monitors until the marks line up across the bezels.")
+        self.ruler_toggle.toggled.connect(self.show_rulers)
+        form.addRow(self.ruler_toggle)
+        reset = QtWidgets.QPushButton("Reset to detected")
+        reset.clicked.connect(lambda: self.load(defaults=True))
+        save = QtWidgets.QPushButton("Save && apply")
+        save.clicked.connect(self.save)
+        form.addRow(reset)
+        form.addRow(save)
+        self.status = QtWidgets.QLabel()
+        self.status.setWordWrap(True)
+        form.addRow(self.status)
+
+        side = QtWidgets.QWidget()
+        side.setLayout(form)
+        side.setFixedWidth(330)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.addWidget(self.view, 1)
+        layout.addWidget(side)
+
+        self.scene.selectionChanged.connect(self.selection_changed)
+        self.load()
+
+    def load(self, defaults=False):
+        mons, jump = read_layout(defaults)
+        self.scene.clear()
+        self.items = [MonitorItem(m, self) for m in mons]
+        for item in self.items:
+            self.scene.addItem(item)
+        self.jump.setChecked(jump)
+        self.show_rulers(self.ruler_toggle.isChecked())  # rebuild them for the new items
+        self.selection_changed()
+        self.fit()
+        self.status.setText("Detected layout loaded (not saved yet)." if defaults else "")
+
+    def fit(self):
+        rect = self.scene.itemsBoundingRect().adjusted(-100, -100, 100, 100)
+        self.scene.setSceneRect(rect.adjusted(-2000, -2000, 2000, 2000))
+        self.view.fitInView(rect, QtCore.Qt.KeepAspectRatio)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fit()
+
+    def selected(self):
+        sel = self.scene.selectedItems()
+        return sel[0] if sel else None
+
+    def selection_changed(self):
+        item = self.selected()
+        for spin in self.spins.values():
+            spin.setEnabled(item is not None)
+        self.selected_label.setText(item.mon["name"] if item else "Select a monitor")
+        if item:
+            self.item_moved(item)
+
+    def show_rulers(self, on):
+        for strip in self.rulers:
+            strip.close()
+        self.rulers = [RulerStrip(item, edge) for item in self.items for edge in RulerStrip.EDGES] if on else []
+        for strip in self.rulers:
+            strip.show()
+        self.ruler_toggle.setText("Hide rulers" if on else "Show rulers")
+
+    def closeEvent(self, event):
+        self.show_rulers(False)
+        super().closeEvent(event)
+
+    def item_moved(self, item):
+        for strip in self.rulers:
+            strip.update()
+        if item is not self.selected():
+            return
+        self.updating = True
+        for key, spin in self.spins.items():
+            spin.setValue(item.mon[key])
+        self.updating = False
+
+    def spin_changed(self):
+        item = self.selected()
+        if self.updating or not item:
+            return
+        for key in ("w", "h"):
+            item.mon[key] = self.spins[key].value()
+        item.sync_size()
+        self.updating = True  # setPos snaps; keep the typed numbers
+        item.setFlag(item.ItemSendsGeometryChanges, False)
+        item.setPos(self.spins["x"].value(), self.spins["y"].value())
+        item.mon["x"], item.mon["y"] = item.pos().x(), item.pos().y()
+        item.setFlag(item.ItemSendsGeometryChanges, True)
+        self.updating = False
+        for strip in self.rulers:
+            strip.update()
+
+    def save(self):
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w") as f:
+            f.write("# trueedged layout: physical position and size of each monitor in mm\n")
+            f.write(f"jump {int(self.jump.isChecked())}\n")
+            for item in self.items:
+                m = item.mon
+                f.write(f'monitor {m["name"]} {m["x"]:.1f} {m["y"]:.1f} {m["w"]:.1f} {m["h"]:.1f}\n')
+        running = subprocess.run(["pkill", "-HUP", "-x", "trueedged"]).returncode == 0
+        status = f"Saved to {CONFIG}. " + ("trueedged reloaded it." if running else
+                                           "trueedged is not running: start it with `trueedged &`.")
+        status += " " + self.realign_screens()
+        self.status.setText(status)
+
+    def realign_screens(self):
+        """Moves the real screens (xrandr) so their pixel layout matches the mm layout."""
+        mons = [item.mon for item in self.items]
+        pos = pixel_positions(mons)
+        if all(pos[m["name"]] == (m["px"], m["py"]) for m in mons):
+            return "Screens already aligned."
+        cmd = ["xrandr"]
+        for name, (x, y) in pos.items():
+            cmd += ["--output", name, "--pos", f"{x}x{y}"]
+        result = subprocess.run(cmd, stderr=subprocess.PIPE, universal_newlines=True)
+        if result.returncode:
+            return f"xrandr failed: {result.stderr.strip()}"
+        # Qt sees the new screen geometry a moment later; then rebuild items and rulers on it
+        QtCore.QTimer.singleShot(800, self.load)
+        return "Screens moved: " + ", ".join(f"{n} +{x}+{y}" for n, (x, y) in pos.items())
+
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = Window()
+    window.show()
+    sys.exit(app.exec_())
